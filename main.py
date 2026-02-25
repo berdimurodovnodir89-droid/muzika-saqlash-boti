@@ -1,7 +1,7 @@
 import os
+import json
 from datetime import datetime
 
-import psycopg2
 from flask import Flask, request
 
 from telegram import (
@@ -20,13 +20,14 @@ from telegram.ext import (
     Filters,
 )
 
-# ================= ENV =================
+# =========================
+# ENV
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # https://your-app.onrender.com
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # masalan: https://your-app.onrender.com
 PORT = int(os.getenv("PORT", "10000"))
 
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()  # "12345,67890"
 ADMIN_IDS = set()
 if ADMIN_IDS_RAW:
     for x in ADMIN_IDS_RAW.split(","):
@@ -35,163 +36,129 @@ if ADMIN_IDS_RAW:
             ADMIN_IDS.add(int(x))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN yo'q (Render Env ga BOT_TOKEN qo'ying).")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL yo'q (Render Postgres URL ni Env ga qo'ying).")
+    raise RuntimeError("BOT_TOKEN yo'q. Render Env ga BOT_TOKEN qo'ying.")
 
-# ================= DB =================
-conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-conn.autocommit = True
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
+# =========================
+# FILE STORAGE
+# =========================
+USERS_FILE = "users.json"
+SONGS_FILE = "songs.json"
+STATE_FILE = "state.json"
 
 CAT_REST = "dam_olishda"
 CAT_STREET = "kochada"
+CAT_TITLE = {CAT_REST: "Dam olishda", CAT_STREET: "Ko‘chada"}
 
-CAT_TITLE = {
-    CAT_REST: "Dam olishda",
-    CAT_STREET: "Ko‘chada",
-}
+# user states
+ACT_NONE = "none"
+ACT_PICK_CATEGORY_FOR_UPLOAD = "pick_cat_for_upload"
+ACT_PICK_CATEGORY_FOR_MENU = "pick_cat_for_menu"
+ACT_AWAIT_SEARCH_TEXT = "await_search_text"
+ACT_AWAIT_BROADCAST_TEXT = "await_broadcast_text"
 
-# callback ids
+# callbacks
 CB_CAT_REST = "cat:dam"
 CB_CAT_STREET = "cat:koch"
+CB_BACK_CATS = "back:cats"
 CB_MENU_ALL = "menu:all"
 CB_MENU_SEARCH = "menu:search"
-CB_BACK_CATS = "back:cats"
 
-# user action states
-ACT_NONE = "none"
-ACT_PICK_CATEGORY_FOR_UPLOAD = "pick_category_for_upload"
-ACT_PICK_CATEGORY_FOR_MENU = "pick_category_for_menu"
-ACT_AWAIT_SEARCH_TEXT = "await_search_text"
+# admin callbacks
+CB_ADM_STATS = "adm:stats"
+CB_ADM_USERS = "adm:users"
+CB_ADM_BCAST = "adm:bcast"
+CB_ADM_CANCEL = "adm:cancel"
 
-def init_db():
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                last_seen TIMESTAMP,
-                seen_count INT DEFAULT 1
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS songs (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT,
-                category TEXT NOT NULL,
-                title TEXT,
-                performer TEXT,
-                file_id TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS user_state (
-                user_id BIGINT PRIMARY KEY,
-                action TEXT NOT NULL DEFAULT 'none',
-                category TEXT,
-                pending_file_id TEXT,
-                pending_title TEXT,
-                pending_performer TEXT,
-                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-        """)
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-def upsert_user(update: Update):
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_users():
+    return load_json(USERS_FILE, {})
+
+def save_users(users):
+    save_json(USERS_FILE, users)
+
+def get_songs():
+    # format: { "dam_olishda": [song, ...], "kochada": [song, ...] }
+    return load_json(SONGS_FILE, {CAT_REST: [], CAT_STREET: []})
+
+def save_songs(songs):
+    # ensure keys exist
+    if CAT_REST not in songs:
+        songs[CAT_REST] = []
+    if CAT_STREET not in songs:
+        songs[CAT_STREET] = []
+    save_json(SONGS_FILE, songs)
+
+def get_state_all():
+    # format: { "<user_id>": {action, category, pending_song, updated_at} }
+    return load_json(STATE_FILE, {})
+
+def save_state_all(state):
+    save_json(STATE_FILE, state)
+
+def get_state(uid: int):
+    st = get_state_all()
+    return st.get(str(uid), {"action": ACT_NONE})
+
+def set_state(uid: int, action: str, category=None, pending_song=None):
+    st = get_state_all()
+    st[str(uid)] = {
+        "action": action,
+        "category": category,
+        "pending_song": pending_song,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    save_state_all(st)
+
+def clear_state(uid: int):
+    set_state(uid, ACT_NONE, None, None)
+
+def track_user(update: Update):
     u = update.effective_user
     if not u:
         return
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO users (id, username, first_name, last_name, last_seen, seen_count)
-            VALUES (%s, %s, %s, %s, %s, 1)
-            ON CONFLICT (id)
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                last_seen = EXCLUDED.last_seen,
-                seen_count = users.seen_count + 1;
-        """, (u.id, u.username, u.first_name, u.last_name, datetime.utcnow()))
+    users = get_users()
+    users[str(u.id)] = {
+        "id": u.id,
+        "username": u.username,
+        "first_name": u.first_name,
+        "last_name": u.last_name,
+        "last_seen": datetime.utcnow().isoformat() + "Z",
+        "seen_count": int(users.get(str(u.id), {}).get("seen_count", 0)) + 1,
+    }
+    save_users(users)
 
-def get_state(user_id: int):
-    with conn.cursor() as cur:
-        cur.execute("SELECT action, category, pending_file_id, pending_title, pending_performer FROM user_state WHERE user_id=%s", (user_id,))
-        row = cur.fetchone()
-    if not row:
-        return (ACT_NONE, None, None, None, None)
-    return row
-
-def set_state(user_id: int, action: str, category=None, pending_file_id=None, pending_title=None, pending_performer=None):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO user_state (user_id, action, category, pending_file_id, pending_title, pending_performer, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (user_id)
-            DO UPDATE SET
-                action = EXCLUDED.action,
-                category = EXCLUDED.category,
-                pending_file_id = EXCLUDED.pending_file_id,
-                pending_title = EXCLUDED.pending_title,
-                pending_performer = EXCLUDED.pending_performer,
-                updated_at = NOW();
-        """, (user_id, action, category, pending_file_id, pending_title, pending_performer))
-
-def clear_state(user_id: int):
-    set_state(user_id, ACT_NONE, None, None, None, None)
-
-def insert_song(user_id: int, category: str, file_id: str, title: str, performer: str):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO songs (user_id, category, title, performer, file_id)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (user_id, category, title, performer, file_id))
-
-def count_songs(category: str):
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM songs WHERE category=%s", (category,))
-        return int(cur.fetchone()[0])
-
-def list_songs(category: str, limit: int = 20):
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, title, performer, file_id, created_at
-            FROM songs
-            WHERE category=%s
-            ORDER BY created_at DESC
-            LIMIT %s
-        """, (category, limit))
-        return cur.fetchall()
-
-def search_songs(category: str, q: str, limit: int = 20):
-    like = f"%{q}%"
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, title, performer, file_id, created_at
-            FROM songs
-            WHERE category=%s
-              AND (COALESCE(title,'') ILIKE %s OR COALESCE(performer,'') ILIKE %s)
-            ORDER BY created_at DESC
-            LIMIT %s
-        """, (category, like, like, limit))
-        return cur.fetchall()
-
-# ================= TELEGRAM CORE =================
+# =========================
+# TELEGRAM CORE
+# =========================
 bot = Bot(token=BOT_TOKEN)
 dispatcher = Dispatcher(bot, None, workers=0, use_context=True)
 
-# ================= UI helpers =================
-def kb_main():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton("📂 Kategoriyalar")]],
-        resize_keyboard=True
-    )
+# =========================
+# UI
+# =========================
+def kb_main(uid: int):
+    rows = [[KeyboardButton("📂 Kategoriyalar")]]
+    if is_admin(uid):
+        rows.append([KeyboardButton("🛠 Admin panel")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def ikb_categories(for_what: str):
     # for_what: "upload" yoki "menu"
-    # callback: cat:<id>|<for>
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🏖 Dam olishda", callback_data=f"{CB_CAT_REST}|{for_what}"),
@@ -200,67 +167,98 @@ def ikb_categories(for_what: str):
     ])
 
 def ikb_category_menu(category: str):
-    title = CAT_TITLE.get(category, category)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎵 Jami qo‘shiqlar", callback_data=f"{CB_MENU_ALL}|{category}")],
         [InlineKeyboardButton("🔎 Qo‘shiqni qidirish", callback_data=f"{CB_MENU_SEARCH}|{category}")],
         [InlineKeyboardButton("⬅️ Kategoriyalarga qaytish", callback_data=CB_BACK_CATS)],
     ])
 
-# ================= COMMANDS =================
+def ikb_admin_panel():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Statistika", callback_data=CB_ADM_STATS)],
+        [InlineKeyboardButton("👥 Foydalanuvchilar", callback_data=CB_ADM_USERS)],
+        [InlineKeyboardButton("📢 Broadcast", callback_data=CB_ADM_BCAST)],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data=CB_ADM_CANCEL)],
+    ])
+
+# =========================
+# COMMANDS
+# =========================
 def start(update, context):
-    upsert_user(update)
-    txt = (
+    track_user(update)
+    uid = update.effective_user.id
+    update.message.reply_text(
         "Assalom aleykum! 🎵\n\n"
-        "Bu botda qo‘shiqlar 2 ta kategoriya bo‘yicha saqlanadi:\n"
+        "Kategoriyalar:\n"
         "🏖 Dam olishda\n"
         "🚶‍♂️ Ko‘chada\n\n"
-        "Qo‘shiq qo‘shish uchun menga music/audio yuboring — keyin qaysi kategoriyaga saqlashni so‘rayman."
+        "Qo‘shiq qo‘shish uchun menga music/audio yuboring.\n"
+        "Keyin qaysi kategoriyaga saqlashni so‘rayman ✅",
+        reply_markup=kb_main(uid)
     )
-    update.message.reply_text(txt, reply_markup=kb_main())
 
 def categories_btn(update, context):
-    upsert_user(update)
-    update.message.reply_text(
-        "Kategoriyani tanlang:",
-        reply_markup=ikb_categories(for_what="menu")
-    )
+    track_user(update)
+    uid = update.effective_user.id
+    update.message.reply_text("Kategoriyani tanlang:", reply_markup=ikb_categories(for_what="menu"))
+    update.message.reply_text("Menu:", reply_markup=kb_main(uid))
+
+def admin_btn(update, context):
+    track_user(update)
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    clear_state(uid)
+    update.message.reply_text("🛠 Admin panel:", reply_markup=ikb_admin_panel())
+
+def admin_cmd(update, context):
+    track_user(update)
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    clear_state(uid)
+    update.message.reply_text("🛠 Admin panel:", reply_markup=ikb_admin_panel())
 
 dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("admin", admin_cmd))
 dispatcher.add_handler(MessageHandler(Filters.regex(r"^📂 Kategoriyalar$"), categories_btn))
+dispatcher.add_handler(MessageHandler(Filters.regex(r"^🛠 Admin panel$"), admin_btn))
 
-# ================= AUDIO HANDLER =================
+# =========================
+# AUDIO HANDLER (save flow)
+# =========================
 def handle_audio(update, context):
-    upsert_user(update)
-    u = update.effective_user
+    track_user(update)
+    uid = update.effective_user.id
     msg = update.message
 
-    audio = None
+    # accept audio or voice
+    file_id = None
     title = None
     performer = None
 
     if msg.audio:
-        audio = msg.audio
-        title = audio.title
-        performer = audio.performer
-        file_id = audio.file_id
+        a = msg.audio
+        file_id = a.file_id
+        title = a.title
+        performer = a.performer
     elif msg.voice:
-        # voice ham qabul qilamiz (xohlasa)
-        audio = msg.voice
-        file_id = audio.file_id
+        v = msg.voice
+        file_id = v.file_id
         title = "Voice"
         performer = None
     else:
         return
 
-    set_state(
-        u.id,
-        ACT_PICK_CATEGORY_FOR_UPLOAD,
-        category=None,
-        pending_file_id=file_id,
-        pending_title=title,
-        pending_performer=performer,
-    )
+    pending_song = {
+        "file_id": file_id,
+        "title": title,
+        "performer": performer,
+        "added_by": uid,
+        "added_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    set_state(uid, ACT_PICK_CATEGORY_FOR_UPLOAD, category=None, pending_song=pending_song)
 
     update.message.reply_text(
         "Qaysi kategoriyaga qo‘shamiz? 👇",
@@ -269,105 +267,167 @@ def handle_audio(update, context):
 
 dispatcher.add_handler(MessageHandler(Filters.audio | Filters.voice, handle_audio))
 
-# ================= CALLBACKS =================
+# =========================
+# CALLBACK ROUTER
+# =========================
 def callback_router(update, context):
-    upsert_user(update)
+    track_user(update)
     q = update.callback_query
-    data = q.data or ""
+    data = (q.data or "").strip()
     q.answer()
 
-    u = q.from_user
-    user_id = u.id
+    uid = q.from_user.id
 
-    # Back
+    # ---- ADMIN CALLBACKS ----
+    if data in (CB_ADM_STATS, CB_ADM_USERS, CB_ADM_BCAST, CB_ADM_CANCEL):
+        if not is_admin(uid):
+            q.answer("Ruxsat yo'q", show_alert=True)
+            return
+
+        if data == CB_ADM_CANCEL:
+            clear_state(uid)
+            q.message.reply_text("Bekor qilindi ✅", reply_markup=kb_main(uid))
+            return
+
+        if data == CB_ADM_STATS:
+            users = get_users()
+            songs = get_songs()
+            total_users = len(users)
+            total_songs = len(songs.get(CAT_REST, [])) + len(songs.get(CAT_STREET, []))
+            q.message.reply_text(
+                "📊 Statistika:\n"
+                f"👥 Users: {total_users}\n"
+                f"🎵 Qo‘shiqlar: {total_songs}\n\n"
+                f"🏖 Dam olishda: {len(songs.get(CAT_REST, []))}\n"
+                f"🚶‍♂️ Ko‘chada: {len(songs.get(CAT_STREET, []))}",
+                reply_markup=kb_main(uid)
+            )
+            return
+
+        if data == CB_ADM_USERS:
+            users = list(get_users().values())
+            users.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
+            users = users[:20]
+            if not users:
+                q.message.reply_text("Userlar yo‘q.", reply_markup=kb_main(uid))
+                return
+
+            lines = ["👥 Oxirgi 20 ta foydalanuvchi:"]
+            for u in users:
+                name = ((u.get("first_name") or "") + " " + (u.get("last_name") or "")).strip() or "NoName"
+                username = u.get("username")
+                tag = f"@{username}" if username else f"id:{u.get('id')}"
+                lines.append(f"- {name} ({tag}) | seen:{u.get('seen_count', 0)} | last:{u.get('last_seen','')}")
+            text = "\n".join(lines)
+            if len(text) > 3900:
+                text = text[:3900] + "\n... (qisqartirildi)"
+            q.message.reply_text(text, reply_markup=kb_main(uid))
+            return
+
+        if data == CB_ADM_BCAST:
+            set_state(uid, ACT_AWAIT_BROADCAST_TEXT, category=None, pending_song=None)
+            q.message.reply_text(
+                "📢 Broadcast matnini yozing.\n"
+                "Misol: Bugun yangi qo‘shiqlar qo‘shildi!\n\n"
+                "Bekor qilish: Admin panel → ❌ Bekor qilish"
+            )
+            return
+
+    # ---- BACK TO CATEGORIES ----
     if data == CB_BACK_CATS:
         q.message.reply_text("Kategoriyani tanlang:", reply_markup=ikb_categories(for_what="menu"))
         return
 
-    # category pick
+    # ---- CATEGORY PICK ----
     if data.startswith("cat:"):
         parts = data.split("|")
-        cat_part = parts[0]     # cat:dam / cat:koch
+        cat_part = parts[0]       # cat:dam / cat:koch
         for_what = parts[1] if len(parts) > 1 else "menu"
 
         category = CAT_REST if cat_part == CB_CAT_REST else CAT_STREET
 
-        # upload flow
         if for_what == "upload":
-            action, _, pending_file_id, pending_title, pending_performer = get_state(user_id)
-            if action != ACT_PICK_CATEGORY_FOR_UPLOAD or not pending_file_id:
-                q.message.reply_text("Qo‘shiq topilmadi. Qaytadan music yuboring 🙂", reply_markup=kb_main())
-                clear_state(user_id)
+            st = get_state(uid)
+            if st.get("action") != ACT_PICK_CATEGORY_FOR_UPLOAD:
+                q.message.reply_text("Holat topilmadi. Qaytadan qo‘shiq yuboring 🙂", reply_markup=kb_main(uid))
+                clear_state(uid)
                 return
 
-            insert_song(
-                user_id=user_id,
-                category=category,
-                file_id=pending_file_id,
-                title=pending_title,
-                performer=pending_performer,
-            )
-            clear_state(user_id)
+            pending = st.get("pending_song")
+            if not pending or not pending.get("file_id"):
+                q.message.reply_text("Qo‘shiq topilmadi. Qaytadan yuboring 🙂", reply_markup=kb_main(uid))
+                clear_state(uid)
+                return
 
-            total = count_songs(category)
+            songs = get_songs()
+            songs.setdefault(CAT_REST, [])
+            songs.setdefault(CAT_STREET, [])
+            songs[category].append(pending)
+            save_songs(songs)
+
+            clear_state(uid)
+
             q.message.reply_text(
                 f"✅ Saqlandi: {CAT_TITLE[category]}\n"
-                f"Bu kategoriyada jami: {total} ta qo‘shiq bor.",
-                reply_markup=kb_main()
+                f"Bu kategoriyada jami: {len(songs[category])} ta qo‘shiq bor.",
+                reply_markup=kb_main(uid)
             )
             return
 
-        # menu flow
         if for_what == "menu":
-            set_state(user_id, ACT_PICK_CATEGORY_FOR_MENU, category=category)
+            set_state(uid, ACT_PICK_CATEGORY_FOR_MENU, category=category, pending_song=None)
             q.message.reply_text(
                 f"Kategoriya: {CAT_TITLE[category]}\nMenu tanlang:",
                 reply_markup=ikb_category_menu(category)
             )
             return
 
-    # menu actions
+    # ---- MENU ACTIONS ----
     if data.startswith("menu:"):
         parts = data.split("|")
         menu_part = parts[0]  # menu:all / menu:search
         category = parts[1] if len(parts) > 1 else None
+
         if category not in (CAT_REST, CAT_STREET):
             q.message.reply_text("Kategoriya topilmadi. Qaytadan tanlang.", reply_markup=ikb_categories(for_what="menu"))
             return
 
         if menu_part == CB_MENU_ALL:
-            total = count_songs(category)
-            rows = list_songs(category, limit=20)
+            songs = get_songs()
+            cat_songs = songs.get(category, [])
+            total = len(cat_songs)
 
             if total == 0:
-                q.message.reply_text("Bu kategoriyada hozircha qo‘shiq yo‘q 🙂", reply_markup=kb_main())
+                q.message.reply_text("Bu kategoriyada hozircha qo‘shiq yo‘q 🙂", reply_markup=kb_main(uid))
                 return
+
+            # show last 20
+            last = cat_songs[-20:][::-1]
 
             q.message.reply_text(
                 f"🎵 {CAT_TITLE[category]} — jami {total} ta.\n"
-                f"Quyida oxirgi {len(rows)} tasi (top 20):"
+                f"Quyida oxirgi {len(last)} tasi (top 20):"
             )
 
-            for (_id, title, performer, file_id, created_at) in rows:
+            for s in last:
                 cap = ""
-                if title:
-                    cap += f"{title}"
-                if performer:
-                    cap += f" — {performer}"
+                if s.get("title"):
+                    cap += str(s.get("title"))
+                if s.get("performer"):
+                    cap += f" — {s.get('performer')}"
                 if not cap:
-                    cap = f"Song #{_id}"
+                    cap = "Qo‘shiq"
 
                 try:
-                    bot.send_audio(chat_id=q.message.chat_id, audio=file_id, caption=cap)
+                    bot.send_audio(chat_id=q.message.chat_id, audio=s["file_id"], caption=cap)
                 except Exception:
-                    # voice bo‘lsa audio yuborish ishlamasligi mumkin, shunda oddiy message
                     bot.send_message(chat_id=q.message.chat_id, text=cap)
 
-            q.message.reply_text("✅ Tayyor", reply_markup=kb_main())
+            q.message.reply_text("✅ Tayyor", reply_markup=kb_main(uid))
             return
 
         if menu_part == CB_MENU_SEARCH:
-            set_state(user_id, ACT_AWAIT_SEARCH_TEXT, category=category)
+            set_state(uid, ACT_AWAIT_SEARCH_TEXT, category=category, pending_song=None)
             q.message.reply_text(
                 "Qidirish uchun nom yozing.\n"
                 "Misol: Shazam yoki Konsta (artist ham bo‘ladi)"
@@ -376,49 +436,93 @@ def callback_router(update, context):
 
 dispatcher.add_handler(CallbackQueryHandler(callback_router))
 
-# ================= TEXT SEARCH HANDLER =================
+# =========================
+# TEXT HANDLER (search + broadcast)
+# =========================
 def handle_text(update, context):
-    upsert_user(update)
-    u = update.effective_user
+    track_user(update)
+    uid = update.effective_user.id
     text = (update.message.text or "").strip()
 
-    action, category, _, _, _ = get_state(u.id)
-    if action != ACT_AWAIT_SEARCH_TEXT or category not in (CAT_REST, CAT_STREET):
-        return  # oddiy text'larni echo qilmaymiz (botingni buzmaslik uchun)
+    st = get_state(uid)
+    action = st.get("action", ACT_NONE)
+    category = st.get("category")
 
-    if not text:
-        update.message.reply_text("Nom yozing 🙂")
+    # --- admin broadcast ---
+    if action == ACT_AWAIT_BROADCAST_TEXT and is_admin(uid):
+        if not text:
+            update.message.reply_text("Matn yozing 🙂")
+            return
+
+        clear_state(uid)
+        users = get_users()
+        ids = [int(v["id"]) for v in users.values() if "id" in v]
+
+        sent = 0
+        fail = 0
+        for chat_id in ids:
+            try:
+                bot.send_message(chat_id=chat_id, text=text)
+                sent += 1
+            except Exception:
+                fail += 1
+
+        update.message.reply_text(
+            f"📢 Broadcast yakunlandi ✅\nYuborildi: {sent}\nXato: {fail}",
+            reply_markup=kb_main(uid)
+        )
         return
 
-    rows = search_songs(category, text, limit=20)
-    clear_state(u.id)
+    # --- search ---
+    if action == ACT_AWAIT_SEARCH_TEXT and category in (CAT_REST, CAT_STREET):
+        if not text:
+            update.message.reply_text("Nom yozing 🙂")
+            return
 
-    if not rows:
-        update.message.reply_text("Hech narsa topilmadi 😕", reply_markup=kb_main())
+        songs = get_songs()
+        cat_songs = songs.get(category, [])
+
+        q = text.lower()
+        results = []
+        for s in cat_songs[::-1]:
+            title = (s.get("title") or "").lower()
+            perf = (s.get("performer") or "").lower()
+            if q in title or q in perf:
+                results.append(s)
+            if len(results) >= 20:
+                break
+
+        clear_state(uid)
+
+        if not results:
+            update.message.reply_text("Hech narsa topilmadi 😕", reply_markup=kb_main(uid))
+            return
+
+        update.message.reply_text(f"🔎 Natijalar ({CAT_TITLE[category]}): {len(results)} ta (top 20)")
+        for s in results:
+            cap = ""
+            if s.get("title"):
+                cap += str(s.get("title"))
+            if s.get("performer"):
+                cap += f" — {s.get('performer')}"
+            if not cap:
+                cap = "Qo‘shiq"
+
+            try:
+                bot.send_audio(chat_id=update.message.chat_id, audio=s["file_id"], caption=cap)
+            except Exception:
+                bot.send_message(chat_id=update.message.chat_id, text=cap)
+
+        update.message.reply_text("✅ Tayyor", reply_markup=kb_main(uid))
         return
 
-    update.message.reply_text(
-        f"🔎 Natijalar ({CAT_TITLE[category]}): {len(rows)} ta (top 20)"
-    )
-    for (_id, title, performer, file_id, created_at) in rows:
-        cap = ""
-        if title:
-            cap += f"{title}"
-        if performer:
-            cap += f" — {performer}"
-        if not cap:
-            cap = f"Song #{_id}"
-
-        try:
-            bot.send_audio(chat_id=update.message.chat_id, audio=file_id, caption=cap)
-        except Exception:
-            bot.send_message(chat_id=update.message.chat_id, text=cap)
-
-    update.message.reply_text("✅ Tayyor", reply_markup=kb_main())
+    # boshqa textlarni e'tiborsiz
 
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
 
-# ================= FLASK WEBHOOK =================
+# =========================
+# FLASK WEBHOOK
+# =========================
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
@@ -443,6 +547,5 @@ def set_webhook():
         print("Webhook set error:", e)
 
 if __name__ == "__main__":
-    init_db()
     set_webhook()
     app.run(host="0.0.0.0", port=PORT)
