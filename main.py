@@ -33,14 +33,15 @@ logging.basicConfig(level=logging.INFO)
 
 
 def check_env():
+    global WEBHOOK_BASE
+
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN yo'q. Render -> Environment ga BOT_TOKEN qo'shing.")
     if not WEBHOOK_BASE:
         raise RuntimeError("WEBHOOK_BASE yo'q. Masalan: https://your-app.onrender.com")
-    # / bilan tugasa olib tashlaymiz (xatoni oldini oladi)
-    while WEBHOOK_BASE.endswith("/"):
-        WEBHOOK_BASE = WEBHOOK_BASE[:-1]
 
+    # / bilan tugasa olib tashlaymiz
+    WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/")
 
 # ------------------ BOT DATA ------------------
 CATEGORIES = {
