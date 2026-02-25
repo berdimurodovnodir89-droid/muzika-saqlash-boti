@@ -1,6 +1,9 @@
 import os
 import logging
+import threading
 from dotenv import load_dotenv
+
+from flask import Flask
 
 from telegram import (
     Update,
@@ -21,10 +24,21 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # masalan: https://muzika-saqlash-boti.onrender.com
 PORT = int(os.getenv("PORT", "10000"))
 
 logging.basicConfig(level=logging.INFO)
+
+# ----------- Flask (UptimeRobot ping uchun) -----------
+flask_app = Flask(__name__)
+
+@flask_app.get("/")
+def home():
+    return "OK"
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT)
+# ------------------------------------------------------
+
 
 # 2 ta kategoriya
 CATEGORIES = {
@@ -40,8 +54,6 @@ USER_SONGS = {}
 def check_env():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN yo'q. Render Environment ga BOT_TOKEN qo'shing.")
-    if not WEBHOOK_BASE:
-        raise RuntimeError("WEBHOOK_BASE yo'q. Masalan: https://muzika-saqlash-boti.onrender.com")
 
 
 def get_user_store(user_id: int):
@@ -88,7 +100,6 @@ def extract_song_info(msg):
         return {"type": "audio", "file_id": msg.audio.file_id, "title": title}
 
     if msg.document:
-        # mp3 ham document bo'lib kelishi mumkin
         title = msg.document.file_name or "document"
         return {"type": "document", "file_id": msg.document.file_id, "title": title}
 
@@ -128,7 +139,6 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Kategoriya ichidagi menu
     if text == "🎵 Jami qo‘shiqlar":
         uid = update.effective_user.id
         active_cat = context.user_data.get("active_category")
@@ -144,7 +154,6 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(f"{CATEGORIES[active_cat]} — jami qo‘shiqlar: {len(songs)} ta")
 
-        # Qo‘shiqlarni bittalab yuboramiz
         for i, s in enumerate(songs, start=1):
             caption = f"{i}) {s['title']}"
             if s["type"] == "audio":
@@ -173,9 +182,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Bosh menu.", reply_markup=main_menu_kb())
         return
 
-    # Oddiy text kelsa
     if context.user_data.get("awaiting_search"):
-        # bu qismga handle_search_text tushadi, bu yerga kelmasin
         return
 
     await update.message.reply_text("Menga audio/mp3 yuboring yoki 📂 Kategoriyalar ni bosing.")
@@ -188,7 +195,6 @@ async def handle_audio_or_doc(update: Update, context: ContextTypes.DEFAULT_TYPE
         await msg.reply_text("Audio yoki mp3 yuboring 🙂")
         return
 
-    # vaqtincha saqlab turamiz, keyin kategoriya so'raymiz
     context.user_data["pending_song"] = song
 
     await msg.reply_text(
@@ -199,7 +205,6 @@ async def handle_audio_or_doc(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # faqat search rejimida ishlaydi
     if not context.user_data.get("awaiting_search"):
         return
 
@@ -217,10 +222,7 @@ async def handle_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Bu kategoriyada qo‘shiq yo‘q.")
         return
 
-    matches = []
-    for s in songs:
-        if query in (s["title"] or "").lower():
-            matches.append(s)
+    matches = [s for s in songs if query in (s["title"] or "").lower()]
 
     if not matches:
         await update.message.reply_text("Hech narsa topilmadi. Yana urinib ko‘ring: 🔎 Qo‘shiqni qidirish")
@@ -242,7 +244,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data or ""
 
-    # Kategoriya ko'rish
     if data.startswith("view:"):
         cat_key = data.split(":", 1)[1]
         if cat_key not in CATEGORIES:
@@ -259,7 +260,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Kategoriya qo'shish
     if data.startswith("add:"):
         cat_key = data.split(":", 1)[1]
         if cat_key not in CATEGORIES:
@@ -275,7 +275,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         store = get_user_store(uid)
         store[cat_key].append(pending)
 
-        # tozalaymiz
         context.user_data.pop("pending_song", None)
 
         await query.message.reply_text(
@@ -290,29 +289,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     check_env()
 
+    # Flask'ni alohida threadda ko'taramiz (UptimeRobot ping uchun)
+    threading.Thread(target=run_flask, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
 
-    # audio/document kelganda
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.ALL, handle_audio_or_doc))
 
-    # qidirish uchun oddiy text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search_text), group=0)
-    # menu textlar
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu), group=1)
 
-    # inline button callback
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # webhook (Render)
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="webhook",
-        webhook_url=f"{WEBHOOK_BASE}/webhook",
-    )
+    # Render + UptimeRobot uchun eng toza rejim:
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
