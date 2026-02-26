@@ -1,133 +1,269 @@
 import os
-import sqlite3
-from datetime import datetime
+import logging
+import asyncio
+from dotenv import load_dotenv
+from aiohttp import web
 
-try:
-    import psycopg2
-    from psycopg2.pool import SimpleConnectionPool
-except Exception:
-    psycopg2 = None
-    SimpleConnectionPool = None
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 
+from storage import make_storage
 
-class Storage:
-    def init(self): ...
-    def add_song(self, user_id: int, category: str, file_id: str, title: str, file_type: str): ...
-    def list_songs(self, user_id: int, category: str): ...
-    def search_songs(self, user_id: int, category: str, q: str): ...
+# ------------------ ENV ------------------
+load_dotenv()
 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # https://xxxx.onrender.com
+PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_PATH = "webhook"  # /webhook
 
-class SQLiteStorage(Storage):
-    def __init__(self, path="songs.db"):
-        self.path = path
-        self.db = None
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("musicbot")
 
-    def init(self):
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL;")
-        self.db.execute("""
-            CREATE TABLE IF NOT EXISTS songs(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                category TEXT NOT NULL,
-                file_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-        """)
-        self.db.execute("CREATE INDEX IF NOT EXISTS idx_user_cat ON songs(user_id, category);")
-        self.db.execute("CREATE INDEX IF NOT EXISTS idx_title ON songs(title);")
-        self.db.commit()
+CATEGORIES = {"dam": "🏖 Dam olishda", "koch": "🚶 Ko‘chada"}
 
-    def add_song(self, user_id, category, file_id, title, file_type):
-        self.db.execute(
-            "INSERT INTO songs(user_id,category,file_id,title,file_type,created_at) VALUES(?,?,?,?,?,?)",
-            (user_id, category, file_id, title, file_type, datetime.utcnow().isoformat()),
-        )
-        self.db.commit()
+def check_env():
+    global WEBHOOK_BASE
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN yo'q (Render -> Environment).")
+    if not WEBHOOK_BASE:
+        raise RuntimeError("WEBHOOK_BASE yo'q. Masalan: https://your-app.onrender.com")
+    WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/")
 
-    def list_songs(self, user_id, category):
-        cur = self.db.execute(
-            "SELECT file_id,title,file_type FROM songs WHERE user_id=? AND category=? ORDER BY id DESC",
-            (user_id, category),
-        )
-        return cur.fetchall()
+def main_menu_kb():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📂 Kategoriyalar")], [KeyboardButton("ℹ️ Yordam")]],
+        resize_keyboard=True
+    )
 
-    def search_songs(self, user_id, category, q):
-        cur = self.db.execute(
-            "SELECT file_id,title,file_type FROM songs WHERE user_id=? AND category=? AND lower(title) LIKE ? ORDER BY id DESC",
-            (user_id, category, f"%{q.lower()}%"),
-        )
-        return cur.fetchall()
+def categories_inline_kb(prefix: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(CATEGORIES["dam"], callback_data=f"{prefix}:dam")],
+        [InlineKeyboardButton(CATEGORIES["koch"], callback_data=f"{prefix}:koch")],
+    ])
 
+def category_actions_kb():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🎵 Jami qo‘shiqlar"), KeyboardButton("🔎 Qo‘shiqni qidirish")],
+            [KeyboardButton("⬅️ Orqaga")]
+        ],
+        resize_keyboard=True
+    )
 
-class PostgresStorage(Storage):
-    def __init__(self, dsn: str):
-        if psycopg2 is None:
-            raise RuntimeError("psycopg2 o'rnatilmagan")
-        self.pool = SimpleConnectionPool(1, 5, dsn=dsn)
+def extract_song_info(msg):
+    if msg.audio:
+        title = msg.audio.title or msg.audio.performer or msg.audio.file_name or "audio"
+        return {"type": "audio", "file_id": msg.audio.file_id, "title": title}
 
-    def init(self):
-        conn = self.pool.getconn()
+    if msg.document:
+        name = (msg.document.file_name or "").lower()
+        mime = (msg.document.mime_type or "").lower()
+        is_audio = mime.startswith("audio/") or name.endswith((".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac"))
+        if not is_audio:
+            return None
+        return {"type": "document", "file_id": msg.document.file_id, "title": msg.document.file_name or "mp3"}
+
+    return None
+
+STORE = None
+
+# ------------------ BOT HANDLERS ------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Assalomu alaykum! 🎧\n\n"
+        f"• {CATEGORIES['dam']}\n• {CATEGORIES['koch']}\n\n"
+        "Audio/mp3 yuboring — saqlayman. Keyin kategoriya tanlaysiz.\n"
+        "📂 Kategoriyalar tugmasini bosing.",
+        reply_markup=main_menu_kb(),
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "1) Audio/mp3 yuboring\n"
+        "2) 📂 Kategoriyalar\n"
+        "3) 🎵 Jami qo‘shiqlar\n"
+        "4) 🔎 Qidirish\n\n"
+        "Ping uchun: /healthz (OK)"
+    )
+
+async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+
+    if t == "ℹ️ Yordam":
+        await help_cmd(update, context)
+        return
+
+    if t == "📂 Kategoriyalar":
+        await update.message.reply_text("Kategoriyani tanlang:", reply_markup=categories_inline_kb("view"))
+        return
+
+    if t == "⬅️ Orqaga":
+        context.user_data.pop("active_category", None)
+        context.user_data.pop("awaiting_search", None)
+        await update.message.reply_text("Bosh menu.", reply_markup=main_menu_kb())
+        return
+
+    if t == "🎵 Jami qo‘shiqlar":
+        cat = context.user_data.get("active_category")
+        if not cat:
+            await update.message.reply_text("Avval 📂 Kategoriyalar")
+            return
+
+        rows = STORE.list_songs(update.effective_user.id, cat)
+        if not rows:
+            await update.message.reply_text("Bu kategoriyada qo‘shiq yo‘q.")
+            return
+
+        await update.message.reply_text(f"{CATEGORIES[cat]} — {len(rows)} ta")
+
+        for i, (file_id, title, ftype) in enumerate(rows[:30], start=1):
+            cap = f"{i}) {title}"
+            try:
+                if ftype == "audio":
+                    await update.message.reply_audio(file_id, caption=cap)
+                else:
+                    await update.message.reply_document(file_id, caption=cap)
+            except Exception:
+                await update.message.reply_text(f"⚠️ Yuborilmadi: {title}")
+
+        if len(rows) > 30:
+            await update.message.reply_text("⚠️ Juda ko‘p: 30 tasi ko‘rsatildi.")
+        return
+
+    if t == "🔎 Qo‘shiqni qidirish":
+        cat = context.user_data.get("active_category")
+        if not cat:
+            await update.message.reply_text("Avval 📂 Kategoriyalar")
+            return
+        context.user_data["awaiting_search"] = True
+        await update.message.reply_text("Qo‘shiq nomini yozing:")
+        return
+
+async def handle_audio_or_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    song = extract_song_info(update.message)
+    if not song:
+        await update.message.reply_text("Faqat audio/mp3 yuboring 🙂")
+        return
+    context.user_data["pending_song"] = song
+    await update.message.reply_text("Qaysi kategoriyaga qo‘shamiz?", reply_markup=categories_inline_kb("add"))
+
+async def handle_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_search"):
+        return
+
+    context.user_data["awaiting_search"] = False
+    cat = context.user_data.get("active_category")
+    if not cat:
+        await update.message.reply_text("Avval 📂 Kategoriyalar")
+        return
+
+    q = (update.message.text or "").strip().lower()
+    rows = STORE.search_songs(update.effective_user.id, cat, q)
+    if not rows:
+        await update.message.reply_text("Topilmadi.")
+        return
+
+    await update.message.reply_text(f"Topildi: {len(rows)} ta")
+    for i, (file_id, title, ftype) in enumerate(rows[:30], start=1):
+        cap = f"{i}) {title}"
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS songs(
-                        id BIGSERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL,
-                        category TEXT NOT NULL,
-                        file_id TEXT NOT NULL,
-                        title TEXT NOT NULL,
-                        file_type TEXT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                """)
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_user_cat_pg ON songs(user_id, category);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_title_pg ON songs(title);")
-            conn.commit()
-        finally:
-            self.pool.putconn(conn)
+            if ftype == "audio":
+                await update.message.reply_audio(file_id, caption=cap)
+            else:
+                await update.message.reply_document(file_id, caption=cap)
+        except Exception:
+            await update.message.reply_text(f"⚠️ Yuborilmadi: {title}")
 
-    def add_song(self, user_id, category, file_id, title, file_type):
-        conn = self.pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO songs(user_id,category,file_id,title,file_type) VALUES(%s,%s,%s,%s,%s)",
-                    (user_id, category, file_id, title, file_type),
-                )
-            conn.commit()
-        finally:
-            self.pool.putconn(conn)
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
 
-    def list_songs(self, user_id, category):
-        conn = self.pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT file_id,title,file_type FROM songs WHERE user_id=%s AND category=%s ORDER BY id DESC",
-                    (user_id, category),
-                )
-                return cur.fetchall()
-        finally:
-            self.pool.putconn(conn)
+    if data.startswith("view:"):
+        cat = data.split(":", 1)[1]
+        context.user_data["active_category"] = cat
+        context.user_data["awaiting_search"] = False
+        await q.message.reply_text(f"{CATEGORIES.get(cat, 'Kategoriya')} ochildi.", reply_markup=category_actions_kb())
+        return
 
-    def search_songs(self, user_id, category, q):
-        conn = self.pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT file_id,title,file_type FROM songs WHERE user_id=%s AND category=%s AND LOWER(title) LIKE %s ORDER BY id DESC",
-                    (user_id, category, f"%{q.lower()}%"),
-                )
-                return cur.fetchall()
-        finally:
-            self.pool.putconn(conn)
+    if data.startswith("add:"):
+        cat = data.split(":", 1)[1]
+        pending = context.user_data.get("pending_song")
+        if not pending:
+            await q.message.reply_text("Avval qo‘shiq yuboring.")
+            return
 
+        STORE.add_song(update.effective_user.id, cat, pending["file_id"], pending["title"], pending["type"])
+        context.user_data.pop("pending_song", None)
+        await q.message.reply_text("✅ Saqlandi.", reply_markup=main_menu_kb())
 
-def make_storage() -> Storage:
-    dsn = os.getenv("DATABASE_URL", "").strip()
-    if dsn:
-        return PostgresStorage(dsn)
-    return SQLiteStorage(os.getenv("DB_PATH", "songs.db").strip())
+# ------------------ AIOHTTP SERVER ------------------
+async def create_web_app(tg_app: Application):
+    aio = web.Application()
+
+    async def root(request):
+        return web.Response(text="OK")
+
+    async def healthz(request):
+        return web.Response(text="OK")
+
+    async def webhook(request):
+        data = await request.json()
+        update = Update.de_json(data, tg_app.bot)
+        await tg_app.process_update(update)
+        return web.Response(text="OK")
+
+    aio.router.add_get("/", root)
+    aio.router.add_get("/healthz", healthz)
+    aio.router.add_post(f"/{WEBHOOK_PATH}", webhook)
+    return aio
+
+async def main_async():
+    global STORE
+    check_env()
+
+    STORE = make_storage()
+    STORE.init()
+
+    tg_app = Application.builder().token(BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("help", help_cmd))
+    tg_app.add_handler(MessageHandler(filters.AUDIO | filters.Document.ALL, handle_audio_or_doc))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search_text), group=0)
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu), group=1)
+    tg_app.add_handler(CallbackQueryHandler(on_callback))
+
+    await tg_app.initialize()
+    await tg_app.start()
+
+    webhook_url = f"{WEBHOOK_BASE}/{WEBHOOK_PATH}"
+    await tg_app.bot.set_webhook(webhook_url)
+    log.info("Webhook set to: %s", webhook_url)
+
+    aio_app = await create_web_app(tg_app)
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("HTTP server running on port %s", PORT)
+
+    # Doimiy ishlasin
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main_async())
